@@ -7,6 +7,8 @@ import time
 import globalPluginHandler
 import speech
 from logHandler import log
+import socket # Added for UDP communication
+import threading # Added for asynchronous UDP sending
 
 # Python 2/3 compatibility
 if sys.version_info[0] >= 3:
@@ -18,6 +20,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	Captures all text spoken by NVDA and outputs it to the View Log
 	"""
 	
+	# Configuration for UDP output
+	UDP_IP = "127.0.0.1"  # Target IP address (localhost)
+	UDP_PORT = 12345      # Target port
+
 	def __init__(self):
 		"""Initialize the plugin and set up speech interception"""
 		super().__init__()
@@ -40,7 +46,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			speech.speech.speak = self._originalSpeak			
 			log.info("NVDA Text Bridge: Plugin terminated - speech capture disabled")
 		except Exception as e:
-			log.error(f"NVDA Text Bridge: Error during termination: {e}")
+			log.error(f"NVDA Text Bridge: Error during termination: {e}") # Changed back to log.error
 		
 		super(GlobalPlugin, self).terminate()
 	
@@ -56,30 +62,51 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			# Only process if capture is enabled
 			if self._captureEnabled:
 				# Log the raw speech sequence for debugging
-				log.debug(f"NVDA Text Bridge: Raw speech sequence: {speechSequence}")
+				log.debug(f"NVDA Text Bridge: Raw speech sequence: {speechSequence}") # Changed to log.debug for raw sequence
 				
 				# Extract text content from speech sequence
 				text_content = self._extractTextFromSequence(speechSequence)
 				
-				if text_content.strip():
+				if text_content.strip(): # Ensure text_content is not empty before processing/sending
 					# Log the captured text with timestamp
 					timestamp = time.strftime("%H:%M:%S", time.localtime())
-					log.info(f"NVDA Text Bridge [{timestamp}]: {text_content}")
+					log.info(f"NVDA Text Bridge [{timestamp}]: {text_content}") # Re-enabled logging of captured text
+
+					# Send text_content via UDP in a separate thread
+					thread = threading.Thread(target=self._sendUdpMessageAsync, args=(text_content,))
+					thread.daemon = True # Allow NVDA to exit even if threads are running
+					thread.start()
 				
 		except Exception as e:
 			# Log errors but don't interrupt speech
-			log.error(f"NVDA Text Bridge: Error capturing speech: {e}")
-			log.debug(f"Error details: {str(e)}", exc_info=True)
+			log.error(f"NVDA Text Bridge: Error capturing speech: {e}") # Changed back to log.error
+			log.debug(f"Error details: {str(e)}", exc_info=True) # Changed to log.debug for details
 		
 		# Call the original speak function to maintain normal NVDA operation
 		return self._originalSpeak(speechSequence, *args, **kwargs)
 	
+	def _sendUdpMessageAsync(self, text_content):
+		"""
+		Sends the given text content via UDP.
+		This method is intended to be run in a separate thread.
+		"""
+		try:
+			sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+			message = text_content.encode('utf-8')
+			sock.sendto(message, (self.UDP_IP, self.UDP_PORT))
+			sock.close()
+			# log.debug(f"NVDA Text Bridge: Sent to UDP {self.UDP_IP}:{self.UDP_PORT} - {len(message)} bytes")
+		except socket.error as se:
+			log.error(f"NVDA Text Bridge: Socket error sending UDP message: {se}")
+		except Exception as e_udp:
+			log.error(f"NVDA Text Bridge: Error sending UDP message: {e_udp}")
+
 	def _extractTextFromSequence(self, speechSequence):
 		"""
 		Extract readable text from a speech sequence
 		
 		Args:
-			speechSequence: NVDA speech sequence (list or single item)
+			speechSequence: NVDA speech sequence (list, tuple, single item, or other iterable)
 			
 		Returns:
 			str: Extracted text content
@@ -87,15 +114,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		text_parts = []
 		
 		# Handle different types of speech sequences
-		if isinstance(speechSequence, list):
+		# In Python 3, `unicode` is an alias for `str`.
+		# Check if speechSequence is iterable (like list or tuple) 
+		# but not a string type itself (which should be treated as a single item).
+		if hasattr(speechSequence, '__iter__') and not isinstance(speechSequence, (str, unicode)):
 			for item in speechSequence:
 				text_parts.append(self._processSequenceItem(item))
 		else:
+			# Treat as a single item if not an iterable (or if it's a string/unicode string)
 			text_parts.append(self._processSequenceItem(speechSequence))
 		
-		# Join all text parts and clean up
-		full_text = " ".join(text_parts)
-		return full_text.strip()
+		# Join all non-empty text parts and clean up.
+		# filter(None, text_parts) removes empty strings (resulting from _processSequenceItem)
+		# before joining, preventing multiple spaces for missing items.
+		full_text = " ".join(filter(None, text_parts))
+		return full_text.strip() # .strip() ensures no leading/trailing whitespace on the final string
 	
 	def _processSequenceItem(self, item):
 		"""
@@ -126,7 +159,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			return ""
 			
 		except Exception as e:
-			log.debug(f"NVDA Text Bridge: Error processing sequence item: {e}")
+			log.debug(f"NVDA Text Bridge: Error processing sequence item: {e}") # Changed to log.debug
 			return ""
 	
 	def script_toggleTextCapture(self, gesture):
