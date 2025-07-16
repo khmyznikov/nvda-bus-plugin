@@ -1,182 +1,156 @@
-# -*- coding: utf-8 -*-
-# NVDA Text Bridge Plugin
-# A global plugin that captures NVDA speech output and logs it to the View Log
-
-import sys
-import time
 import globalPluginHandler
-import speech
+from speech.extensions import pre_speechQueued  # Import the event
 from logHandler import log
-import socket # Added for UDP communication
-import threading # Added for asynchronous UDP sending
+import asyncio
+import threading
+import sys
+import os
 
-# Python 2/3 compatibility
-if sys.version_info[0] >= 3:
-	unicode = str
+# Add the lib directory to the path so we can import the websockets module
+addon_dir = os.path.dirname(os.path.dirname(__file__))
+lib_path = os.path.join(addon_dir, "lib")
+sys.path.append(lib_path)
+
+import websockets
+
+class WebSocketServer:
+    def __init__(self, host='127.0.0.1', port=8765):
+        self.host = host
+        self.port = port
+        self.clients = set()
+        self.server = None
+        self.loop = None
+        self.thread = None
+        self.running = False
+
+    async def ws_handler(self, websocket):
+        """Handle client connections"""
+        self.clients.add(websocket)
+        try:
+            log.info(f"NVDA Text Bridge: WebSocket client connected: {websocket.remote_address}")
+            # Keep connection alive until client disconnects
+            await websocket.wait_closed()
+        finally:
+            self.clients.remove(websocket)
+            log.info(f"NVDA Text Bridge: WebSocket client disconnected: {websocket.remote_address}")
+
+    async def broadcast(self, message):
+        """Send message to all connected clients"""
+        if not self.clients:
+            return
+            
+        # Create tasks for sending to each client
+        tasks = [client.send(message) for client in self.clients.copy()]
+        if tasks:
+            # Run all tasks concurrently and gather results
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Check for exceptions
+            for client, result in zip(self.clients.copy(), results):
+                if isinstance(result, Exception):
+                    log.error(f"NVDA Text Bridge: Error sending to client {client.remote_address}: {result}")
+                    # Client might be disconnected, try to remove it
+                    try:
+                        self.clients.remove(client)
+                        await client.close()
+                    except:
+                        pass
+
+    def send_message(self, message):
+        """Send message from outside the event loop"""
+        if self.loop and self.running:
+            asyncio.run_coroutine_threadsafe(self.broadcast(message), self.loop)
+
+    async def start_server(self):
+        """Start the WebSocket server"""
+        self.server = await websockets.serve(
+            self.ws_handler, self.host, self.port
+        )
+        log.info(f"NVDA Text Bridge: WebSocket server started on {self.host}:{self.port}")
+        self.running = True
+        # Keep the server running
+        await self.server.wait_closed()
+
+    def run_server(self):
+        """Run the server in a new event loop"""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self.start_server())
+        except Exception as e:
+            log.error(f"NVDA Text Bridge: WebSocket server error: {e}")
+        finally:
+            self.running = False
+            self.loop.close()
+
+    def start(self):
+        """Start the server in a background thread"""
+        self.thread = threading.Thread(target=self.run_server, daemon=True)
+        self.thread.start()
+        log.info("NVDA Text Bridge: WebSocket server thread started")
+
+    def stop(self):
+        """Stop the WebSocket server"""
+        if self.server and self.loop and self.running:
+            async def shutdown():
+                if self.server is not None:
+                    self.server.close()
+                    await self.server.wait_closed()
+                    log.info("NVDA Text Bridge: WebSocket server stopped")
+            
+            future = asyncio.run_coroutine_threadsafe(shutdown(), self.loop)
+            try:
+                future.result(timeout=5)
+            except:
+                log.error("NVDA Text Bridge: Failed to stop WebSocket server gracefully")
+        
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1)
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	"""
 	NVDA Text Bridge Global Plugin
 	Captures all text spoken by NVDA and outputs it to the View Log
+	and sends it to connected WebSocket clients
 	"""
-	
-	# Configuration for UDP output
-	UDP_IP = "127.0.0.1"  # Target IP address (localhost)
-	UDP_PORT = 12345      # Target port
 
 	def __init__(self):
 		"""Initialize the plugin and set up speech interception"""
 		super().__init__()
 		
-		# Initialize capture state
 		self._captureEnabled = True
 		
-		# Store original speech function
-		self._originalSpeak = speech.speech.speak
-		
-		# Replace speech.speak with our custom function
-		speech.speech.speak = self._interceptSpeak
+		# Initialize WebSocket server
+		self.ws_server = WebSocketServer()
+		self.ws_server.start()
+
+		pre_speechQueued.register(self._onPreSpeechQueued)
 		
 		log.info("NVDA Text Bridge: Plugin initialized - speech capture enabled")
 	
+	def _onPreSpeechQueued(self, speechSequence):
+		"""
+		Handler for pre_speechQueued event.
+		Captures speech before it is queued and sends it to WebSocket clients.
+		"""
+
+		for chunk in speechSequence:
+			if not isinstance(chunk, str):  # Not text (maybe a pitch change, beep, etc.). Not useful for us.
+				continue
+			log.info(f"NVDA Text Bridge: Raw speech sequence: {chunk}")
+			# Send the speech text to WebSocket clients
+			self.ws_server.send_message(chunk)
+	
 	def terminate(self):
-		"""Clean up when plugin is terminated"""
+		"""Clean up when the plugin is terminated"""
 		try:
-			# Restore original speech function
-			speech.speech.speak = self._originalSpeak			
-			log.info("NVDA Text Bridge: Plugin terminated - speech capture disabled")
-		except Exception as e:
-			log.error(f"NVDA Text Bridge: Error during termination: {e}") # Changed back to log.error
-		
-		super(GlobalPlugin, self).terminate()
-	
-	def _interceptSpeak(self, speechSequence, *args, **kwargs):
-		"""
-		Intercept speech calls and log the text content
-		
-		Args:
-			speechSequence: The speech sequence to be spoken
-			*args, **kwargs: Additional arguments passed to speech.speak
-		"""
-		try:
-			# Only process if capture is enabled
-			if self._captureEnabled:
-				# Log the raw speech sequence for debugging
-				log.debug(f"NVDA Text Bridge: Raw speech sequence: {speechSequence}") # Changed to log.debug for raw sequence
-				
-				# Extract text content from speech sequence
-				text_content = self._extractTextFromSequence(speechSequence)
-				
-				if text_content.strip(): # Ensure text_content is not empty before processing/sending
-					# Log the captured text with timestamp
-					timestamp = time.strftime("%H:%M:%S", time.localtime())
-					log.info(f"NVDA Text Bridge [{timestamp}]: {text_content}") # Re-enabled logging of captured text
-
-					# Send text_content via UDP in a separate thread
-					thread = threading.Thread(target=self._sendUdpMessageAsync, args=(text_content,))
-					thread.daemon = True # Allow NVDA to exit even if threads are running
-					thread.start()
-				
-		except Exception as e:
-			# Log errors but don't interrupt speech
-			log.error(f"NVDA Text Bridge: Error capturing speech: {e}") # Changed back to log.error
-			log.debug(f"Error details: {str(e)}", exc_info=True) # Changed to log.debug for details
-		
-		# Call the original speak function to maintain normal NVDA operation
-		return self._originalSpeak(speechSequence, *args, **kwargs)
-	
-	def _sendUdpMessageAsync(self, text_content):
-		"""
-		Sends the given text content via UDP.
-		This method is intended to be run in a separate thread.
-		"""
-		try:
-			sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-			message = text_content.encode('utf-8')
-			sock.sendto(message, (self.UDP_IP, self.UDP_PORT))
-			sock.close()
-			# log.debug(f"NVDA Text Bridge: Sent to UDP {self.UDP_IP}:{self.UDP_PORT} - {len(message)} bytes")
-		except socket.error as se:
-			log.error(f"NVDA Text Bridge: Socket error sending UDP message: {se}")
-		except Exception as e_udp:
-			log.error(f"NVDA Text Bridge: Error sending UDP message: {e_udp}")
-
-	def _extractTextFromSequence(self, speechSequence):
-		"""
-		Extract readable text from a speech sequence
-		
-		Args:
-			speechSequence: NVDA speech sequence (list, tuple, single item, or other iterable)
+			pre_speechQueued.unregister(self._onPreSpeechQueued)
+		except:
+			pass
 			
-		Returns:
-			str: Extracted text content
-		"""
-		text_parts = []
-		
-		# Handle different types of speech sequences
-		# In Python 3, `unicode` is an alias for `str`.
-		# Check if speechSequence is iterable (like list or tuple) 
-		# but not a string type itself (which should be treated as a single item).
-		if hasattr(speechSequence, '__iter__') and not isinstance(speechSequence, (str, unicode)):
-			for item in speechSequence:
-				text_parts.append(self._processSequenceItem(item))
-		else:
-			# Treat as a single item if not an iterable (or if it's a string/unicode string)
-			text_parts.append(self._processSequenceItem(speechSequence))
-		
-		# Join all non-empty text parts and clean up.
-		# filter(None, text_parts) removes empty strings (resulting from _processSequenceItem)
-		# before joining, preventing multiple spaces for missing items.
-		full_text = " ".join(filter(None, text_parts))
-		return full_text.strip() # .strip() ensures no leading/trailing whitespace on the final string
-	
-	def _processSequenceItem(self, item):
-		"""
-		Process individual items in a speech sequence
-		
-		Args:
-			item: Individual speech sequence item
+		# Stop the WebSocket server
+		if hasattr(self, 'ws_server'):
+			self.ws_server.stop()
 			
-		Returns:
-			str: Text representation of the item
-		"""
-		try:
-			# Handle string items (most common)
-			if isinstance(item, str):
-				return item
-			
-			# Handle unicode strings
-			elif isinstance(item, unicode):
-				return item
-			
-			# Handle speech commands and other objects
-			elif hasattr(item, '__str__'):
-				str_repr = str(item)
-				# Filter out speech commands that start with special characters
-				if not str_repr.startswith('<') and not str_repr.startswith('_'):
-					return str_repr
-			
-			return ""
-			
-		except Exception as e:
-			log.debug(f"NVDA Text Bridge: Error processing sequence item: {e}") # Changed to log.debug
-			return ""
-	
-	def script_toggleTextCapture(self, gesture):
-		"""
-		Script to toggle text capture on/off
-		Can be bound to a gesture if needed
-		"""
-		if hasattr(self, '_captureEnabled'):
-			self._captureEnabled = not self._captureEnabled
-		else:
-			self._captureEnabled = False
-		
-		status = "enabled" if self._captureEnabled else "disabled"
-		log.info(f"NVDA Text Bridge: Text capture {status}")
-	
-	# Gesture binding (optional)
-	__gestures = {
-		# Uncomment and modify if you want to bind a key combination
-		# "kb:NVDA+shift+t": "toggleTextCapture",
-	}
+		log.info("NVDA Text Bridge: Plugin terminated")
+		super().terminate()
